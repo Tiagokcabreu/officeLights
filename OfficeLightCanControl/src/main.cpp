@@ -1,12 +1,18 @@
 #include <0configs.h>
 
+#define MY_NODE_ID 2
+#define MAX_NODES 3
+
 unsigned long lastTestMessageTime = 0;
 const unsigned long testMessageInterval = 1000; // Send every 1 second
 uint8_t testCounter = 0;
 
 float reference;     // Reference value for PID control
+float gain;
+float gains[MAX_NODES];
 float currentMillis; // Current time in milliseconds
 bool manualDuty = false; // Flag for manual mode
+bool gains_stashed = false;
 
 // Time configurations
 unsigned long LastUpdate_500Hz = 0;
@@ -30,6 +36,12 @@ CANHandler canHandler(spi0, 5, 3, 4, 2, 10000000);
 // Serial Interface to comunicate with PC
 pcInterface interface(luxMeter, driver, pidController, metrics, canHandler);
 
+// Instantiate the NetworkBoot class.
+NetworkBoot networkBoot(MY_NODE_ID);
+
+CalibrationManager* calibrator = nullptr;
+bool calibration_ready = false;
+
 void setup()
 {
     interface.begin(115200); // Start serial communication with PC
@@ -41,7 +53,6 @@ void setup()
 
     raspConfig(); // Configure the Raspberry Pi based on its unique ID
 
-    calibrate_Gd();
 
     if (!canHandler.begin(CAN_1000KBPS)) {
         Serial.println("CAN initialization failed!");
@@ -49,11 +60,41 @@ void setup()
     }
     canHandler.setTransmitInterval(1000); // Set transmit interval to 1000ms
 
+    networkBoot.begin();
     
 }
 
 void loop()
 {
+
+    if (!networkBoot.isBootComplete()){
+        calibration_ready = false;
+        networkBoot.update(); // keep booting
+        return;
+    }
+
+    // --- Step 2: Initialize Calibration ---
+    if (networkBoot.isBootComplete() && !calibration_ready){
+        receive_nodes();  // sets calibration_ready = true
+        return;
+    }
+
+    // --- Step 3: Run Calibration Once ---
+    if (calibrator && !calibrator->isCalibrationComplete()) {
+        calibrator->startCalibration();
+        return;
+    }
+
+    if (calibrator->isCalibrationComplete() && !gains_stashed) {
+        gains = calibrator->getAllGains();
+        gain = calibrator->getOwnGain();
+        float offset = calibrator->getOffset();
+        driver.setGainOffset(gain, offset);
+        pidController.setGainAndExternal(gain, offset); // Set the gain and external illuminance in the controller
+        gains_stashed = true;
+        return;
+    }
+
     currentMillis = millis(); // Get the current time in milliseconds
 
     if (currentMillis - LastUpdate_500Hz >= FREQ_500Hz)
@@ -296,3 +337,15 @@ void calibrate_Gd()
     
     Serial.printf("G: %f, d: %f\n", driver.G, driver.d);
 }
+
+void receive_nodes() {
+    const uint8_t* discovered_ids = networkBoot.getDiscoveredNodeIDs();
+    int count = networkBoot.getNodeCount();
+
+    if (count > 0) {
+        if (calibrator != nullptr) delete calibrator; // cleanup if already exists
+        calibrator = new CalibrationManager(MY_NODE_ID, discovered_ids, count, 7000);
+        calibration_ready = true;
+        Serial.println("Calibration manager initialized.");
+    }
+}    
